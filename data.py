@@ -50,3 +50,12 @@ def generate_segp_dataset(
     f_x = _se_gp_prior_sample(x, lengthscale=lengthscale)
     y = _get_noisy_observations(f_x, noise_level=noise_level)
     return x, y
+
+
+def autocorrelation(samples: torch.Tensor, lag: int) -> torch.Tensor:
+    # TODO: finish this
+    mean = torch.mean(samples, dim=0)
+    covariances = torch.mean((samples[:-lag, :] - mean) * (samples[lag:, :] - mean))
+    variances = torch.var(samples, dim=0)
+    autocorrelation = covariances / variances
+    return autocorrelation

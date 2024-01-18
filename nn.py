@@ -1,8 +1,9 @@
 import torch
 from torch import nn
 from tqdm import tqdm
+from typing import Optional
 
-# TODO: add support for optional bias
+# TODO: refactor this into a BasePerceptron class and then DeterministicPerceptron, LangevinPerceptron, HamiltonianPerceptron on top
 
 
 class LinearLayer(nn.Module):
@@ -122,7 +123,7 @@ class Perceptron(nn.Module):
         epochs: int = 100,
         algorithm: str = "Adam",
         learning_rate: float = 1e-2,
-    ):
+    ) -> torch.Tensor:
         assert loss_function.lower() in ["map", "ml"]
         assert algorithm.lower() in ["sgd", "adam"]
 
@@ -147,3 +148,123 @@ class Perceptron(nn.Module):
             optimiser.step()
 
         return loss_evolution
+
+    def params_to_sample(self) -> torch.Tensor:
+        return torch.cat((self.layer_1.w.flatten(), self.layer_2.w.flatten()))
+
+    def sample_to_params(self, sample: torch.Tensor):
+        self.layer_1.w.data = sample[: self.layer_1.w.numel()].view(
+            (self.layer_1.output_dim, self.layer_1.input_dim + int(self.layer_1.bias))
+        )
+        self.layer_2.w.data = sample[self.layer_1.w.numel() :].view(
+            (self.layer_2.output_dim, self.layer_2.input_dim + int(self.layer_2.bias))
+        )
+
+    def get_log_potential(
+        self, x: torch.Tensor, y: torch.Tensor, sample: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        # U(q) = - log posterior, i.e. U(q) = - log(likelihood) - log(prior) + c
+        # this equation is conveniently already implemented in MAP_loss (up to negative sign and plus c term)
+
+        # swap current parameters for parameters we are interested in evaluating
+        if sample is not None:  #
+            current_params = self.params_to_sample()
+            self.sample_to_params(sample)
+
+        U = -self.MAP_loss(x, y)
+
+        # return model parameters to what they were before this function call
+        if sample is not None:
+            self.sample_to_params(current_params)
+
+        return U
+
+    def get_log_potential_grad(
+        self, x: torch.Tensor, y: torch.Tensor, sample: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        # compute gradients of potential w.r.t. parameters of interest (sample)
+        U = self.get_log_potential(x, y, sample)
+        self.zero_grad()
+        U.backward()
+        grads = torch.cat(
+            (self.layer_1.w.grad.flatten(), self.layer_2.w.grad.flatten())
+        )
+        return grads
+
+    def get_langevin_proposal(
+        self, x: torch.Tensor, y: torch.Tensor, step_size: float = 1e-4
+    ):
+        # q* = q - step_size/2 * grad(U(q)) + sqrt(step_size) * randn
+        params = self.params_to_sample()
+        proposed_params = (
+            params
+            - (step_size / 2) * self.get_log_potential_grad(x, y)
+            + torch.sqrt(torch.tensor(step_size)) * torch.randn_like(params)
+        )
+        return proposed_params
+
+    def compute_log_langevin_proposal_prob(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        sample: torch.Tensor,
+        proposed_sample: torch.Tensor,
+        step_size: float = 1e-4,
+    ):
+        # - 1/(2*stepsize)||q* - q - stepsize/2 * grad U(q)||^2
+        grad_u = self.get_log_potential_grad(x, y, sample)
+        norm = torch.linalg.vector_norm(
+            proposed_sample - sample - (step_size / 2) * grad_u
+        )
+        log_prob = -(1 / (2 * step_size)) * torch.pow(norm, 2)
+        return log_prob
+
+    def compute_log_acceptance_prob(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        sample: torch.Tensor,
+        proposed_sample: torch.Tensor,
+        step_size: float = 1e-4,
+    ):
+        u_q = self.get_log_potential(x, y, sample)
+        u_q_star = self.get_log_potential(x, y, proposed_sample)
+        q_to_q_star = self.compute_log_langevin_proposal_prob(
+            x, y, sample, proposed_sample, step_size=step_size
+        )
+        q_star_to_q = self.compute_log_langevin_proposal_prob(
+            x, y, proposed_sample, sample, step_size=step_size
+        )
+        return u_q_star - u_q + q_star_to_q - q_to_q_star
+
+    def langevin_monte_carlo(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        simulation_steps: int = 1000,
+        step_size: float = 1e-4,
+        pbar: bool = True,
+    ):
+        sample_dimension = self.layer_1.w.numel() + self.layer_2.w.numel()
+        posterior_samples = torch.zeros((simulation_steps, sample_dimension))
+        acceptance_counter = 0
+
+        for step in tqdm(range(simulation_steps), disable=not pbar):
+            current_sample = self.params_to_sample()
+            proposed_sample = self.get_langevin_proposal(x, y, step_size=step_size)
+            log_alpha = self.compute_log_acceptance_prob(
+                x, y, current_sample, proposed_sample, step_size=step_size
+            )
+            u = torch.rand((1,))
+            if u < log_alpha.exp():
+                # accept the sample
+                posterior_samples[step] = proposed_sample
+                self.sample_to_params(proposed_sample)
+                acceptance_counter += 1
+            else:
+                # reject the sample
+                posterior_samples[step] = current_sample
+
+        average_acceptance = acceptance_counter / simulation_steps
+
+        return posterior_samples, average_acceptance
