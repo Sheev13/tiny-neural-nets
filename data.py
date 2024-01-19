@@ -52,10 +52,10 @@ def generate_segp_dataset(
     return x, y
 
 
-def autocorrelation(samples: torch.Tensor, lag: int) -> torch.Tensor:
-    # TODO: finish this
-    mean = torch.mean(samples, dim=0)
-    covariances = torch.mean((samples[:-lag, :] - mean) * (samples[lag:, :] - mean))
+def autocorrelation(samples: torch.Tensor, lag: int = 0) -> torch.Tensor:
+    means = torch.mean(samples, dim=0)
     variances = torch.var(samples, dim=0)
-    autocorrelation = covariances / variances
-    return autocorrelation
+    lagged_samples = torch.roll(samples, -lag, 0)
+    covariances = ((samples - means) * (lagged_samples - means)).mean(dim=0)
+    autocorrelations = covariances / variances
+    return autocorrelations
