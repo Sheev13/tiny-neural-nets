@@ -2,6 +2,7 @@ import torch
 from torch import nn
 from tqdm import tqdm
 from typing import Optional, Tuple
+from collections import defaultdict
 
 
 class LinearLayer(nn.Module):
@@ -442,7 +443,7 @@ class HamiltonianPerceptron(MCMCPerceptron):
         simulation_steps: int = 1000,
         step_size: float = 1e-4,
         leapfrog_steps: int = 50,
-        momentum_std: float = 1.0,
+        momentum_std: float = 1e-4,
         pbar: bool = True,
         metropolis_adjust: bool = True, 
     ):
@@ -451,8 +452,9 @@ class HamiltonianPerceptron(MCMCPerceptron):
         acceptance_counter = 0
         
         current_momentum = momentum_std * torch.randn((sample_dimension,))
-
-        for step in tqdm(range(simulation_steps), disable=not pbar):
+        iter_pbar = tqdm(range(simulation_steps), disable=not pbar)
+        for step in iter_pbar:
+            metrics = defaultdict(float)
             current_sample = self.params_to_sample()
             proposed_sample, proposed_momentum = self.get_hamilton_proposal(x, y, step_size=step_size, leapfrog_steps=leapfrog_steps)
             if metropolis_adjust:
@@ -474,6 +476,11 @@ class HamiltonianPerceptron(MCMCPerceptron):
                 current_momentum = proposed_momentum
                 self.sample_to_params(proposed_sample)
                 acceptance_counter += 1
+                
+            with torch.no_grad():
+                metrics["log potential"] = float(self.get_potential(x, y, self.params_to_sample()))
+                metrics["average acceptance"] = acceptance_counter / (step + 1)
+            iter_pbar.set_postfix(metrics)
 
         average_acceptance = acceptance_counter / simulation_steps
 
