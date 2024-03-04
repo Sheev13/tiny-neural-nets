@@ -137,7 +137,7 @@ class MCMCPerceptron(BasePerceptron):
             + self.layer_2_prior.log_prob(self.layer_2.w).sum()
         )
 
-        U = -(log_likelihood + log_prior)
+        U = - (log_likelihood + log_prior)
 
         # return model parameters to what they were before this function call
         if sample is not None:

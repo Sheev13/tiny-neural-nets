@@ -5,6 +5,7 @@ from typing import Optional, Tuple
 from collections import defaultdict
 from .base_nets import MCMCPerceptron
 
+
 class LangevinPerceptron(MCMCPerceptron):
     def __init__(
         self,
@@ -68,7 +69,7 @@ class LangevinPerceptron(MCMCPerceptron):
         q_star_to_q = self.compute_log_langevin_proposal_prob(
             x, y, proposed_sample, sample, step_size=step_size
         )
-        return u_q_star - u_q + q_star_to_q - q_to_q_star
+        return min(0, u_q_star - u_q + q_star_to_q - q_to_q_star)
 
     def langevin_monte_carlo(
         self,
@@ -106,9 +107,11 @@ class LangevinPerceptron(MCMCPerceptron):
                 posterior_samples[step] = proposed_sample
                 self.sample_to_params(proposed_sample)
                 acceptance_counter += 1
-                
+
             with torch.no_grad():
-                metrics["log potential"] = float(self.get_potential(x, y, self.params_to_sample()))
+                metrics["log potential"] = float(
+                    self.get_potential(x, y, self.params_to_sample())
+                )
                 metrics["average acceptance"] = acceptance_counter / (step + 1)
             iter_pbar.set_postfix(metrics)
 
@@ -157,33 +160,31 @@ class HamiltonianPerceptron(MCMCPerceptron):
         self,
         x: torch.Tensor,
         y: torch.Tensor,
+        sample: torch.Tensor,
+        momentum: torch.Tensor,
         step_size: float = 1e-4,
         leapfrog_steps: int = 50,
     ) -> Tuple[torch.Tensor]:
-        sample = self.params_to_sample()
-        momentum = torch.randn_like(sample)
 
-        new_sample, new_momentum = self.execute_leapfrog_step(
-            sample, momentum, x, y, step_size=step_size
-        )
-        for _ in range(leapfrog_steps - 1):
+        new_sample = sample
+        new_momentum = momentum
+
+        for _ in range(leapfrog_steps):
             new_sample, new_momentum = self.execute_leapfrog_step(
                 new_sample, new_momentum, x, y, step_size=step_size
             )
-        proposal, proposal_momentum = new_sample, new_momentum
 
-        return proposal, proposal_momentum
+        return new_sample, new_momentum
 
     def compute_hamiltonian(
         self,
         sample: torch.Tensor,
         momentum: torch.Tensor,
-        momentum_std: float,
         x: torch.Tensor,
         y: torch.Tensor,
     ) -> torch.Tensor:
         potential = self.get_potential(x, y, sample)
-        kinetic = 0.5 * momentum.T @ torch.eye(sample.shape[0]) @ momentum * (momentum_std**2)
+        kinetic = 0.5 * (torch.linalg.vector_norm(momentum) ** 2)
         return potential + kinetic
 
     def compute_log_hmc_acceptance(
@@ -192,19 +193,18 @@ class HamiltonianPerceptron(MCMCPerceptron):
         current_momentum: torch.Tensor,
         proposal: torch.Tensor,
         proposal_momentum: torch.Tensor,
-        momentum_std: float,
         x: torch.Tensor,
         y: torch.Tensor,
     ) -> torch.Tensor:
         proposal_hamiltonian = self.compute_hamiltonian(
-            proposal, proposal_momentum, momentum_std, x, y
+            proposal, proposal_momentum, x, y
         )
         current_hamiltonian = self.compute_hamiltonian(
-            current_sample, current_momentum, momentum_std, x, y
+            current_sample, current_momentum, x, y
         )
         # if the leapfrog simulation is accurate enough,
         # the log acceptance probability should be zero due to energy conservation
-        return current_hamiltonian - proposal_hamiltonian
+        return min(torch.tensor(0.0), current_hamiltonian - proposal_hamiltonian)
 
     def hamiltonian_monte_carlo(
         self,
@@ -213,29 +213,39 @@ class HamiltonianPerceptron(MCMCPerceptron):
         simulation_steps: int = 1000,
         step_size: float = 1e-4,
         leapfrog_steps: int = 50,
-        momentum_std: float = 1e-4,
         pbar: bool = True,
-        metropolis_adjust: bool = True, 
+        metropolis_adjust: bool = True,
     ):
         sample_dimension = self.layer_1.w.numel() + self.layer_2.w.numel()
         posterior_samples = torch.zeros((simulation_steps, sample_dimension))
         acceptance_counter = 0
-        
-        current_momentum = momentum_std * torch.randn((sample_dimension,))
+
         iter_pbar = tqdm(range(simulation_steps), disable=not pbar)
         for step in iter_pbar:
             metrics = defaultdict(float)
             current_sample = self.params_to_sample()
-            proposed_sample, proposed_momentum = self.get_hamilton_proposal(x, y, step_size=step_size, leapfrog_steps=leapfrog_steps)
+            current_momentum = torch.randn_like(current_sample)
+            proposed_sample, proposed_momentum = self.get_hamilton_proposal(
+                x,
+                y,
+                current_sample,
+                current_momentum,
+                step_size=step_size,
+                leapfrog_steps=leapfrog_steps,
+            )
             if metropolis_adjust:
                 log_alpha = self.compute_log_hmc_acceptance(
-                    current_sample, current_momentum, proposed_sample, proposed_momentum, momentum_std, x, y
+                    current_sample,
+                    current_momentum,
+                    proposed_sample,
+                    proposed_momentum,
+                    x,
+                    y,
                 )
                 u = torch.rand((1,))
                 if u < log_alpha.exp():
                     # accept the sample
                     posterior_samples[step] = proposed_sample
-                    current_momentum = proposed_momentum
                     self.sample_to_params(proposed_sample)
                     acceptance_counter += 1
                 else:
@@ -243,15 +253,45 @@ class HamiltonianPerceptron(MCMCPerceptron):
                     posterior_samples[step] = current_sample
             else:
                 posterior_samples[step] = proposed_sample
-                current_momentum = proposed_momentum
                 self.sample_to_params(proposed_sample)
                 acceptance_counter += 1
-                
+
             with torch.no_grad():
-                metrics["log potential"] = float(self.get_potential(x, y, self.params_to_sample()))
+                metrics["log potential"] = float(
+                    self.get_potential(x, y, self.params_to_sample())
+                )
                 metrics["average acceptance"] = acceptance_counter / (step + 1)
             iter_pbar.set_postfix(metrics)
 
         average_acceptance = acceptance_counter / simulation_steps
 
-        return posterior_samples, average_acceptance
+        return posterior_samples, average_acceptance, metrics
+
+
+    # this function is mainly for debugging purposes
+    def get_energy_evolution(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        step_size: float = 1e-4,
+        leapfrog_steps: int = 50,
+        pbar: bool = True,
+    ):
+        new_sample = self.params_to_sample()
+        new_momentum = torch.randn_like(new_sample)
+        energy_evolution = torch.zeros(
+            leapfrog_steps,
+        )
+
+        for i in tqdm(range(leapfrog_steps), disable=not pbar):
+            new_sample, new_momentum = self.execute_leapfrog_step(
+                new_sample, new_momentum, x, y, step_size=step_size
+            )
+            energy_evolution[i] = self.compute_hamiltonian(
+                new_sample,
+                new_momentum,
+                x,
+                y,
+            ).detach()
+
+        return energy_evolution
