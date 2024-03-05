@@ -69,7 +69,7 @@ class LangevinPerceptron(MCMCPerceptron):
         q_star_to_q = self.compute_log_langevin_proposal_prob(
             x, y, proposed_sample, sample, step_size=step_size
         )
-        return min(0, u_q_star - u_q + q_star_to_q - q_to_q_star)
+        return min(torch.tensor(0.0), u_q_star - u_q + q_star_to_q - q_to_q_star)
 
     def langevin_monte_carlo(
         self,
